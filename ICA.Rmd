@@ -1,0 +1,636 @@
+---
+title: "ICA Analysis"
+author: "Manuel Marín & Hugo Hernández"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: true
+    toc: true      
+    toc_depth: 3  
+    toc_float: true 
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("whitening")
+library("OpenImageR")
+library("plotly") 
+```
+
+# Introduction
+
+To begin, let's consider the following photo that we could find in the Assignment document:
+
+```{r}
+img_path = "pesoni.jpg"  
+img = readImage(img_path)
+plot(as.raster(img))
+```
+
+Since the full-resolution image can be very large, we create a subsampled version to perform the optimization step efficiently while preserving the main color structure. The complete explanation can be found in this [section](#sec-fullimg).
+```{r}
+s = dim(img) # c(x, y, channels)
+s
+```
+
+```{r}
+img_small = img[seq(1, s[1], by = 5),
+                 seq(1, s[2], by = 5),
+                 ]
+dim(img_small)
+```
+This dimensions are much more manageable. 
+
+
+The following function will allow us to transform an image into a matrix, having each of the different 3 channels in a different column. By doing this, each pixel gets treated as an unique observation:
+```{r}
+convert_to_matrix = function(img){
+
+N = dim(img)[1] * dim(img)[2]
+
+
+X = matrix(NA, nrow = N, ncol = 3)
+
+
+X[,1] = as.vector(img[,,1])  # canal R
+X[,2] = as.vector(img[,,2])  # canal G
+X[,3] = as.vector(img[,,3])  # canal B
+
+return (X)
+
+}
+```
+
+
+Considering our original submatrix:
+```{r}
+matrix = convert_to_matrix (img_small)
+dim (matrix)
+```
+
+## Whitening the matrix
+
+Whitening is a useful preprocessing step because it centers the data and linearly transforms it so that feature dimensions become decorrelated and have comparable scale, which reduces redundancy and makes ML problems better conditioned. 
+
+In ICA-like pipelines, this simplification is especially valuable because, after whitening, searching for informative directions can be restricted to orthogonal vectors, which reduces the complexity of the problem and typically makes projection-based separation criteria behave more stably (as shown in the following references: [[1]](https://aclanthology.org/2023.acl-long.677.pdf), [[2]](https://cerco.cnrs.fr/pagesp/arno/indexica.html)).
+
+```{r}
+whitening = function (matrix){
+  X_centered = scale(matrix, center=TRUE, scale=FALSE)
+  covX = cov(X_centered)
+  eig = eigen(covX)
+  D_inv_sqrt = diag(1 / sqrt(eig$values))
+  W = eig$vectors %*% D_inv_sqrt
+  Z = X_centered %*% W
+  return (list(Z = Z, W = W, center = attr(X_centered, "scaled:center")))  
+}
+```
+
+
+We verify the whitening by checking that the column means are close to zero:
+
+```{r}
+whitening_result = whitening(matrix)  
+whitened_matrix = whitening_result$Z
+W_transform = whitening_result$W
+center_values = whitening_result$center
+
+colMeans(whitened_matrix)
+```
+
+And the covariance matrix is close to the identity:
+
+```{r}
+cov_whitened_matrix = cov(whitened_matrix)
+cov_whitened_matrix
+```
+
+# Small Matrix Calculus
+
+We define some functions in order to modularise the process, looking foward to repeat it with the other images in the following sections
+
+
+First, let's see some Helper Functions:
+
+
+The Fisher index quantifies how well a projection separates two groups by favoring large separation between cluster means and small within-cluster variance.
+
+```{r}
+
+get_fisher = function(z) {
+
+  km = kmeans(z, centers = 2, nstart = 5)
+ 
+  m1 = km$centers[1]
+  m2 = km$centers[2]
+  
+  v1 = if (length(z[km$cluster == 1]) > 1) var(z[km$cluster == 1]) else 0
+  v2 = if (length(z[km$cluster == 2]) > 1) var(z[km$cluster == 2]) else 0
+
+
+
+  fisher_idx = (m1 - m2)^2 / (v1 + v2 + 1e-8)
+  return(fisher_idx)
+}
+
+```
+
+The cross product is used to generate orthogonal directions in 3D, allowing us to complete an orthonormal basis once the first two directions are found.
+
+```{r}
+cross_product <- function(a, b) {
+  c(a[2]*b[3] - a[3]*b[2],
+    a[3]*b[1] - a[1]*b[3],
+    a[1]*b[2] - a[2]*b[1])
+}
+```
+
+When moving from the subsampled image to the full image, we must apply the same whitening transform (same centering and whitening matrix) to keep the coordinate system consistent.
+
+```{r}
+apply_whitening <- function(X, W_transform, center_values) {
+  X_centered <- scale(X, center = center_values, scale = FALSE)
+  Z <- X_centered %*% W_transform
+  Z
+}
+```
+
+Now, we define the function `find_ica`, that given a whittened matrix, and some parameters for the subsequent grid search, searches the three orthonormal directions $ (w_1, w_2, w_3)$  that maximize the Fisher separability of the 1D projected data under k-means; considering two clusters. 
+
+```{r}
+find_ica <- function(whitened_matrix, n_pasos = 50, n_angles = 200) {
+
+  # w1: sphere grid
+  theta_vec <- seq(0, 2*pi, length.out = n_pasos)
+  phi_vec   <- seq(0, pi,   length.out = n_pasos)
+
+  #we take some initial (and infeasible) configurations to avoid possible errors
+  fisher_surface <- matrix(0, nrow = n_pasos, ncol = n_pasos)
+  best_f <- -Inf
+  best_w <- c(0,0,0)
+
+  for(i in 1:n_pasos) {
+    for(j in 1:n_pasos) {
+      th <- theta_vec[i]
+      ph <- phi_vec[j]
+
+      w <- c(cos(th)*sin(ph),
+             sin(th)*sin(ph),
+             cos(ph))
+
+      z_proj <- whitened_matrix %*% w
+      f_val <- get_fisher(z_proj)
+      fisher_surface[i, j] <- f_val
+
+      #we take the best configuration
+      if(f_val > best_f) {
+        best_f <- f_val
+        best_w <- w
+      }
+    }
+  }
+
+  #we save the best configuration
+  w1 <- best_w 
+
+  # We consider auxiliar ON vectors u2, u3 that will allow us to do the w2 grid search
+  if (abs(w1[3]) < 0.9) v <- c(0,0,1) else v <- c(1,0,0)
+
+  u2 <- v - sum(v*w1)*w1
+  u2 <- u2 / sqrt(sum(u2^2))
+  u3 <- cross_product(w1, u2)  
+
+
+  # w2: optimize on circle orthogonal to w1
+  alpha_vec <- seq(0, 2*pi, length.out = n_angles)
+  fisher_circle <- numeric(n_angles)
+
+  for(i in 1:n_angles) {
+    w <- cos(alpha_vec[i]) * u2 + sin(alpha_vec[i]) * u3
+    z_proj <- whitened_matrix %*% w
+    fisher_circle[i] <- get_fisher(z_proj)
+  }
+
+  best_alpha <- alpha_vec[which.max(fisher_circle)]
+  w2 <- cos(best_alpha) * u2 + sin(best_alpha) * u3
+
+  # w3
+  w3 <- cross_product(w1, w2)
+  w3 <- w3
+  # the product of two normal vectors is a noemal vector
+
+  list(
+    w1 = w1, w2 = w2, w3 = w3,
+    best_f1 = best_f,
+    fisher_surface = fisher_surface,
+    theta_vec = theta_vec,
+    phi_vec = phi_vec,
+    alpha_vec = alpha_vec,
+    fisher_circle = fisher_circle,
+    best_alpha = best_alpha
+  )
+}
+
+```
+
+
+
+## First Component
+
+We scan the unit sphere (theta, phi) to find the direction $w_1$ that maximizes Fisher separability after projecting and clustering the data.
+
+```{r}
+ica <- find_ica(whitened_matrix, n_pasos = 50, n_angles = 200)
+
+w1 <- ica$w1
+```
+
+
+```{r}
+# w1 search image
+plot_ly(x = ica$phi_vec, y = ica$theta_vec, z = ica$fisher_surface) %>%
+  add_surface() %>%
+  layout(title = "Fisher Optimization (1st Projection)")
+
+```
+
+After choosing w1, we project all pixels onto this direction.
+
+We can observe that the projection is clearly bimodal, due to the two-class segmentation.
+```{r}
+# Projection
+proj1_small <- whitened_matrix %*% w1
+
+# Histogram
+hist(proj1_small, breaks = 50, col = "gray", main = "1st Projection")
+```
+We then apply k-means to the 1D projected values to visualize the segmentation result.
+
+```{r}
+# Segmentation
+km_1 <- kmeans(proj1_small, centers = 2, nstart = 5)
+mask_1 <- matrix(km_1$cluster, nrow = dim(img_small)[1], ncol = dim(img_small)[2])
+image(mask_1, col = gray.colors(2), main = "1st Projection Segmentation")
+
+```
+
+## Second Component
+
+Given the first independent component $w_1 \in \mathbb{R}^3$, the orthogonal subspace is two-dimensional. We first construct an orthonormal basis $\{ u_2, u_3 \}$ of this subspace via Gram-Schmidt orthogonalization followed by cross product completion. The second component is then obtained by maximizing the Fisher discriminant over the parametrization $w(\alpha) = cos(\alpha)u_2 + sin(\alpha)u_3$, where $\alpha \in [0, 2\pi)$. 
+
+```{r}
+w2 <- ica$w2
+
+```
+
+In 3D, the unit directions orthogonal to $w_1$ form a circle, so we only need a 1D search over an angle $\alpha$, which is both faster and enforces orthogonality.
+
+```{r}
+# w2 search image
+plot(ica$alpha_vec, ica$fisher_circle, type = "l", lwd = 2,
+     xlab = "Angle (radians)", ylab = "Fisher Index",
+     main = "Fisher Optimization over Orthogonal Circle")
+points(ica$best_alpha, max(ica$fisher_circle), col = "red", pch = 19, cex = 2)
+```
+
+We again inspect the projection histogram and the induced segmentation to see what additional structure is captured beyond the first component.
+
+```{r}
+#Projection
+proj2_small <- whitened_matrix %*% w2
+
+#Histogram
+hist(proj2_small, breaks = 50, col = "lightblue",  main = "2nd Projection")
+
+```
+
+```{r}
+# Segmentation
+km_2 <- kmeans(proj2_small, centers = 2, nstart = 5)
+mask_2 <- matrix(km_2$cluster, nrow = dim(img_small)[1], ncol = dim(img_small)[2])
+image(mask_2, col = gray.colors(2), main = "2nd Projection Segmentation")
+
+```
+
+
+## Third Component
+
+The third component is uniquely determined as $w_3 = w_1 \times w_2$, completing the orthonormal change of basis. This projection typically captures residual variation not highlighted by the first two directions, which can correspond to borders, shading, or fine texture.
+
+```{r}
+w3 <- ica$w3
+```
+
+```{r}
+# Projection
+proj3_small <- whitened_matrix %*% w3
+
+# Histogram 
+hist(proj3_small, breaks = 50, col = "lightgreen", main = "3rd Projection")
+```
+
+```{r}
+# Segmentation
+km_3 <- kmeans(proj3_small, centers = 2, nstart = 5)
+mask_3 <- matrix(km_3$cluster, nrow = dim(img_small)[1], ncol = dim(img_small)[2])
+image(mask_3, col = gray.colors(2), main = "3rd Projection Segmentation")
+```
+
+# Complete Image Calculus
+
+Now we apply the orthonormal basis obtained from the subsampled image to the full-resolution image.
+
+```{r}
+# Convert full image to matrix
+matrix_full = convert_to_matrix(img)
+dim(matrix_full)
+```
+
+## Whitening of the Full Image  {#sec-fullimg}
+
+The procedure of estimating whitening parameters on a training subset and subsequently applying them to a larger dataset is standard practice in Independent Component Analysis. As described by [Hyvärinen and Oja (2000)](https://www.cs.helsinki.fi/u/ahyvarin/papers/NN00new.pdf) and elaborated in [Hyvärinen et al. (2001)](https://www.cs.helsinki.fi/u/ahyvarin/papers/bookfinal_ICA.pdf), the whitening transformation is a preprocessing step that reduces the complexity of ICA by transforming the mixing matrix into an orthogonal form, effectively solving "half of the problem". 
+
+The independent component directions are defined in the specific whitened coordinate space, making it necessary to use the same whitening parameters for both training and test data. Small deviations from perfect whitening in the full image (mean $\approx$ 0, covariance matrix $\approx$ I) are expected and do not compromise the validity of the extracted components.
+
+```{r}
+# Apply the  whitening transformation 
+whitened_matrix_full = apply_whitening(matrix_full, W_transform, center_values)
+```
+
+
+Let's verify that the whitening generalised well:
+
+```{r}
+cat("Mean of whitened full matrix:\n")
+print(colMeans(whitened_matrix_full))
+cat("\nCovariance of whitened full matrix:\n")
+print(cov(whitened_matrix_full))
+```
+
+The orthonormal basis was computed on a subsampled version of the image to reduce computational cost during optimization. Once obtained, this change of basis was applied to the full-resolution image, demonstrating that the independent components generalize from the training subset to the complete dataset
+
+```{r}
+# Apply the change of basis (w1, w2, w3) obtained from the small image
+proj1_full = whitened_matrix_full %*% w1
+proj2_full = whitened_matrix_full %*% w2
+proj3_full = whitened_matrix_full %*% w3
+```
+
+## Segmentation on Full Image
+
+```{r}
+# 1st component
+km_1_full <- kmeans(proj1_full, centers = 2, nstart = 5)
+mask_1_full <- matrix(km_1_full$cluster, nrow = dim(img)[1], ncol = dim(img)[2])
+
+image(mask_1_full, col = gray.colors(2), main = "1st Component")
+hist(proj1_full, breaks = 80, col = "gray", main = "1st component", xlab = "Projection value")
+
+```
+
+
+```{r}
+# Segment using second component
+km_2_full = kmeans(proj2_full, centers = 2, nstart = 5)
+mask_2_full = matrix(km_2_full$cluster, nrow = dim(img)[1], ncol = dim(img)[2])
+image(mask_2_full, col = gray.colors(2), main = "2nd Component")
+
+hist(proj2_full, breaks = 80, col = "lightblue",
+     main = "2nd component", xlab = "Projection value")
+```
+
+```{r}
+# Segment using third component
+km_3_full = kmeans(proj3_full, centers = 2, nstart = 5)
+mask_3_full = matrix(km_3_full$cluster, nrow = dim(img)[1], ncol = dim(img)[2])
+image(mask_3_full, col = gray.colors(2), main = "3rd Component")
+
+hist(proj3_full, breaks = 80, col = "lightgreen",
+     main = "3rd component", xlab = "Projection value")
+```
+
+## Final Comparison
+
+```{r fig.width=10, fig.height=8}
+par(mfrow = c(2, 2))
+plot(as.raster(img), xlab = "", ylab = "")
+title("Original Image")
+image(mask_1_full, col = gray.colors(2), main = "1st Component")
+image(mask_2_full, col = gray.colors(2), main = "2nd Component")
+image(mask_3_full, col = gray.colors(2), main = "3rd Component")
+```
+
+# Calculus for all the images
+
+Now, we repeat this equal process with the rest of the images, in order to analyze the Independent Components of all of them. 
+We consider the following pipeline, that includes all the previous steps in a single function:
+
+```{r}
+run_image_pipeline <- function(img_path, subsample_by = 5, n_pasos = 50, n_angles = 200) {
+
+  img <- readImage(img_path)
+  s <- dim(img)
+
+  img_small <- img[seq(1, s[1], by = subsample_by),
+                   seq(1, s[2], by = subsample_by), ]
+
+  matrix_small <- convert_to_matrix(img_small)
+  whitening_result <- whitening(matrix_small)
+
+  whitened_small <- whitening_result$Z
+  W_transform <- whitening_result$W
+  center_values <- whitening_result$center
+
+  ica <- find_ica(whitened_small, n_pasos = n_pasos, n_angles = n_angles)
+  w1 <- ica$w1; w2 <- ica$w2; w3 <- ica$w3
+
+  matrix_full <- convert_to_matrix(img)
+  whitened_full <- apply_whitening(matrix_full, W_transform, center_values)
+
+  proj1_full <- whitened_full %*% w1
+  proj2_full <- whitened_full %*% w2
+  proj3_full <- whitened_full %*% w3
+
+  km1 <- kmeans(proj1_full, centers = 2, nstart = 5)
+  km2 <- kmeans(proj2_full, centers = 2, nstart = 5)
+  km3 <- kmeans(proj3_full, centers = 2, nstart = 5)
+
+  make_mask <- function(km_cluster, img) {
+    mask <- matrix(km_cluster,
+                   nrow = dim(img)[1],
+                   ncol = dim(img)[2])
+  
+    # Adapt to image() coordinate system
+    t(mask)[ , nrow(mask):1]
+  }
+  
+  mask1 <- make_mask(km1$cluster, img)
+  mask2 <- make_mask(km2$cluster, img)
+  mask3 <- make_mask(km3$cluster, img)
+
+
+
+  list(
+    img = img,
+    img_small = img_small,
+    ica = ica,
+    w1 = w1, w2 = w2, w3 = w3,
+    proj1_full = proj1_full, proj2_full = proj2_full, proj3_full = proj3_full,
+    mask_1_full = mask1, mask_2_full = mask2, mask_3_full = mask3
+  )
+}
+```
+
+
+
+
+## Town
+
+We consider the image: 
+
+```{r}
+img_path_town = "town.jpg"  
+img_town = readImage(img_path_town)
+plot(as.raster(img_town))
+```
+
+```{r}
+res_town <- run_image_pipeline(img_path_town, subsample_by = 5, n_pasos = 50, n_angles = 200)
+```
+
+```{r}
+image(res_town$mask_1_full, col = gray.colors(2), main = "Town: w1")
+image(res_town$mask_2_full, col = gray.colors(2), main = "Town: w2")
+image(res_town$mask_3_full, col = gray.colors(2), main = "Town: w3")
+```
+
+```{r}
+par(mfrow = c(1,3))
+hist(res_town$proj1_full, breaks = 80, col = "gray",
+     main = "Town: w1", xlab = "Projection value")
+hist(res_town$proj2_full, breaks = 80, col = "lightblue",
+     main = "Town: w2", xlab = "Projection value")
+hist(res_town$proj3_full, breaks = 80, col = "lightgreen",
+     main = "Town: w3", xlab = "Projection value")
+```
+
+
+## Pasta
+
+We consider the image: 
+
+```{r}
+img_path_pasta = "Food.jpg"  
+img_pasta = readImage(img_path_pasta)
+plot(as.raster(img_pasta))
+```
+
+```{r}
+res_pasta <- run_image_pipeline(img_path_pasta, subsample_by = 5, n_pasos = 50, n_angles = 200)
+```
+
+```{r}
+image(res_pasta$mask_1_full, col = gray.colors(2), main = "Pasta: w1")
+image(res_pasta$mask_2_full, col = gray.colors(2), main = "Pasta: w2")
+image(res_pasta$mask_3_full, col = gray.colors(2), main = "Pasta: w3")
+
+
+asmask1 <- res_pasta$mask_1_full[nrow(res_pasta$mask_1_full):1, ]
+
+```
+
+```{r}
+
+
+
+```
+
+
+```{r}
+par(mfrow = c(1,3))
+hist(res_pasta$proj1_full, breaks = 80, col = "gray",
+     main = "Pasta: w1", xlab = "Projection value")
+hist(res_pasta$proj2_full, breaks = 80, col = "lightblue",
+     main = "Pasta: w2", xlab = "Projection value")
+hist(res_pasta$proj3_full, breaks = 80, col = "lightgreen",
+     main = "Pasta: w3", xlab = "Projection value")
+```
+
+
+
+## Diamond
+
+
+We consider the image: 
+
+```{r}
+img_path_diamond = "Test_1.jpg"  
+img_diamond = readImage(img_path_diamond)
+plot(as.raster(img_diamond))
+```
+
+```{r}
+res_diamond <- run_image_pipeline(img_path_diamond, subsample_by = 5, n_pasos = 50, n_angles = 200)
+```
+
+```{r}
+image(res_diamond$mask_1_full, col = gray.colors(2), main = "Diamond: w1")
+image(res_diamond$mask_2_full, col = gray.colors(2), main = "Diamond: w2")
+image(res_diamond$mask_3_full, col = gray.colors(2), main = "Diamond: w3")
+
+```
+
+```{r}
+par(mfrow = c(1,3))
+hist(res_diamond$proj1_full, breaks = 80, col = "gray",
+     main = "Diamond: w1", xlab = "Projection value")
+hist(res_diamond$proj2_full, breaks = 80, col = "lightblue",
+     main = "Diamond: w2", xlab = "Projection value")
+hist(res_diamond$proj3_full, breaks = 80, col = "lightgreen",
+     main = "Diamond: w3", xlab = "Projection value")
+```
+
+
+
+## Melanoma
+
+We consider the image: 
+
+```{r}
+img_path_melanoma = "Melanoma.jpg"  
+img_melanoma = readImage(img_path_melanoma)
+plot(as.raster(img_melanoma))
+```
+
+```{r}
+res_melanoma <- run_image_pipeline(img_path_melanoma, subsample_by = 5, n_pasos = 50, n_angles = 200)
+```
+
+```{r}
+image(res_melanoma$mask_1_full, col = gray.colors(2), main = "Melanoma: w1")
+image(res_melanoma$mask_2_full, col = gray.colors(2), main = "Melanoma: w2")
+image(res_melanoma$mask_3_full, col = gray.colors(2), main = "Melanoma: w3")
+
+```
+
+
+
+
+
+```{r}
+par(mfrow = c(1,3))
+hist(res_melanoma$proj1_full, breaks = 80, col = "gray",
+     main = "Melanoma: w1", xlab = "Projection value")
+hist(res_melanoma$proj2_full, breaks = 80, col = "lightblue",
+     main = "Melanoma: w2", xlab = "Projection value")
+hist(res_melanoma$proj3_full, breaks = 80, col = "lightgreen",
+     main = "Melanoma: w3", xlab = "Projection value")
+```
